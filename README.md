@@ -2,11 +2,25 @@
 
 Cross-platform git hooks for Octopus Deploy developer workflows.
 
+## Prerequisites
+
+- [Python 3.12+](https://www.python.org/downloads/)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
+
+> **Windows:** Ensure `python3` (or `python`) is on your PATH in Git Bash. The hook bootstraps
+> its own dependencies via `uv` automatically.
+
 ## Setup
 
 ```bash
-git clone https://github.com/OctopusDeploy/git-hooks-toolbox ~/Dev/Octo/git-hooks-toolbox
-git config --global core.hooksPath ~/Dev/Octo/git-hooks-toolbox
+git clone https://github.com/OctopusDeploy/git-hooks-toolbox ~/.git-hooks-toolbox
+git config --global core.hooksPath ~/.git-hooks-toolbox
+```
+
+## Updating
+
+```bash
+git -C ~/.git-hooks-toolbox pull
 ```
 
 ## Hooks
