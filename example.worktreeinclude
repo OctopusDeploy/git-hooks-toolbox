@@ -1,0 +1,28 @@
+# Env files
+.env
+.env.*
+*.env
+
+# Local JSON settings
+local.settings.json
+settings.local.json
+appsettings.[lL]ocal.json
+appsettings.[dD]evelopment.json
+appsettings.*.[dD]evelopment.json
+
+# Terraform local vars
+*.tfvars
+*.tfvars.json
+*.local.auto.tfvars
+
+# Tool-local settings
+.claude/settings.local.json
+
+# Exclude generated/vendor paths (avoid false positives)
+!**/.docusaurus/**
+!**/.pnpm/**
+!**/bin/**
+!**/build/**
+!**/node_modules/**
+!**/obj/**
+!**/publish/**

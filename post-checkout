@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["psutil>=6.1.0"]
+# ///
+
+"""
+DESCRIPTION: Automatically copies local files from source worktree to newly created worktrees
+
+FEATURES:
+- Cross-platform source detection via ancestor process CWD walk (Windows/macOS/Linux)
+- Pattern-based file copying using .worktreeinclude (gitignore syntax)
+- User-wide fallback: ~/.worktreeinclude applies when repo .worktreeinclude missing
+- Safety: no overwrites, size limits (10MB), path traversal protection
+
+DEPENDENCIES:
+  Python 3.12+: Latest LTS with 5-year support (until Oct 2028+)
+  psutil: Process detection (auto-installed by uv)
+  uv: Package manager
+  git: For worktree and file detection commands
+
+SETUP:
+  To use these git hooks globally:
+    git clone https://github.com/OctopusDeploy/git-hooks-toolbox ~/Dev/Octo/git-hooks-toolbox
+    git config --global core.hooksPath ~/Dev/Octo/git-hooks-toolbox
+
+  To verify configuration:
+    git config --global core.hooksPath
+
+PATTERN FILE (.worktreeinclude):
+  Create .worktreeinclude (gitignore syntax) in repository root for repo-specific
+  patterns, or ~/.worktreeinclude for user-wide defaults applied to all repos.
+
+  Repository .worktreeinclude takes priority over user-wide ~/.worktreeinclude.
+
+  Example ~/.worktreeinclude (user-wide defaults):
+    # Environment files
+    .env
+    .env.local
+    .env.*.local
+
+    # .NET local configs
+    appsettings.Local.json
+    appsettings.Development.json
+
+    # Claude settings
+    .claude/settings.local.json
+
+    # Terraform local vars
+    *.local.tfvars
+
+  Example .worktreeinclude (repo-specific, overrides user-wide):
+    # Project-specific patterns
+    .env
+    appsettings.Production.json
+    secrets.json
+
+BEHAVIOR:
+  1. Only runs on worktree creation (prev_ref is all zeros)
+  2. Detects source worktree via GIT_WORKTREE_SOURCE env var if set
+  3. Detects source worktree by walking ancestor process CWDs in same repo
+  4. Falls back to worktree with most recently modified .worktreeinclude-matched file
+  5. Falls back to git-common-dir (main worktree) if all detection fails
+  6. Looks for .worktreeinclude in repo root, then ~/.worktreeinclude
+  7. Skips pattern-based copying if no pattern file exists
+  8. Uses git ls-files with pattern file for matching
+  9. Never overwrites existing files in destination worktree
+  10. Skips files larger than 10MB
+  11. Validates all paths within worktree boundaries
+
+EXIT CODES:
+  0: Success (files copied or nothing to copy)
+  1: Error (invalid arguments, missing dependencies with no fallback)
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+# Optional dependency with graceful degradation
+try:
+    import psutil
+
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+
+# Constants
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+
+def _ensure_uv_runtime() -> None:
+    """
+    Relaunch this hook via `uv run --script` when uv is available.
+
+    Homebrew runs git commands with a sanitized PATH that commonly excludes
+    `/opt/homebrew/bin`, so a `#!/usr/bin/env -S uv ...` shebang fails before
+    Python can run. Bootstrapping from Python lets us print a clear warning
+    instead of the opaque `env: uv: No such file or directory`.
+    """
+    if os.environ.get("GIT_HOOK_UV_BOOTSTRAPPED") == "1":
+        return
+
+    uv_bin = shutil.which("uv")
+    if not uv_bin:
+        print(
+            "Warning: 'uv' not found on PATH; continuing without uv-managed dependencies.",
+            file=sys.stderr,
+        )
+        return
+
+    env = os.environ.copy()
+    env["GIT_HOOK_UV_BOOTSTRAPPED"] = "1"
+    try:
+        result = subprocess.run([uv_bin, "run", "--script", __file__, *sys.argv[1:]], env=env)
+        raise SystemExit(result.returncode)
+    except OSError as exc:
+        print(
+            f"Warning: Failed to bootstrap via uv ({exc}); continuing without uv-managed dependencies.",
+            file=sys.stderr,
+        )
+        return
+
+
+def _get_git_common_dir(cwd: Optional[Path] = None) -> Optional[Path]:
+    """
+    Get git common directory for a working tree.
+
+    Args:
+        cwd: Directory to run git command in (defaults to current process cwd)
+
+    Returns:
+        Resolved git common-dir path, or None if detection fails
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        common_dir = Path(result.stdout.strip())
+        if common_dir.is_absolute():
+            return common_dir.resolve()
+
+        base_dir = cwd.resolve() if cwd else Path.cwd().resolve()
+        return (base_dir / common_dir).resolve()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+
+
+def _validate_source_worktree(
+    source_candidate: Path, current_worktree: Path, current_common_dir: Path
+) -> Optional[Path]:
+    """
+    Validate source worktree candidate belongs to same repository.
+
+    Args:
+        source_candidate: Candidate source worktree path
+        current_worktree: Current destination worktree path
+        current_common_dir: git common-dir of current worktree
+
+    Returns:
+        Resolved source path if valid, otherwise None
+    """
+    try:
+        source_candidate = source_candidate.expanduser().resolve()
+    except OSError:
+        return None
+
+    if source_candidate == current_worktree:
+        return None
+
+    source_common_dir = _get_git_common_dir(source_candidate)
+    if not source_common_dir or source_common_dir != current_common_dir:
+        return None
+
+    return source_candidate
+
+
+def list_repo_worktrees() -> list[Path]:
+    """
+    List all worktree paths in the current repository.
+
+    Returns:
+        List of resolved worktree Paths, or empty list on error
+    """
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, check=True,
+        )
+        return [
+            Path(line.split(" ", 1)[1]).resolve()
+            for line in result.stdout.splitlines()
+            if line.startswith("worktree ")
+        ]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+
+
+def find_source_by_pattern_mtime(
+    pattern_file: Path,
+    current_worktree: Path,
+    current_common_dir: Path,
+) -> Optional[Path]:
+    """
+    Find source worktree by picking the one with the most recently modified
+    .worktreeinclude-matched file.
+
+    Args:
+        pattern_file: Path to .worktreeinclude pattern file
+        current_worktree: Current destination worktree (excluded from candidates)
+        current_common_dir: git common-dir of current worktree (used for same-repo check)
+
+    Returns:
+        Path to the worktree with the newest matching file, or None if none found
+    """
+    best_worktree: Optional[Path] = None
+    best_mtime = 0.0
+    best_file: Optional[Path] = None
+
+    for candidate in list_repo_worktrees():
+        validated = _validate_source_worktree(candidate, current_worktree, current_common_dir)
+        if not validated:
+            continue
+
+        for rel_path in find_matches(validated, pattern_file):
+            abs_path = validated / rel_path
+            try:
+                mtime = abs_path.stat().st_mtime
+                if mtime > best_mtime:
+                    best_mtime = mtime
+                    best_worktree = validated
+                    best_file = abs_path
+            except OSError:
+                pass
+
+    if best_worktree:
+        print(
+            f"Info: Source worktree detection method: .worktreeinclude mtime ({best_worktree})",
+            file=sys.stderr,
+        )
+        print(
+            f"Info: Most recently modified matching file: {best_file}",
+            file=sys.stderr,
+        )
+
+    return best_worktree
+
+
+def find_source_worktree() -> Optional[Path]:
+    """
+    Find source worktree where git worktree add was invoked.
+
+    Strategy:
+    1. Return GIT_WORKTREE_SOURCE env var if set and valid.
+    2. Walk process ancestors and inspect each CWD.
+    3. Return first candidate that is a different directory from current
+       worktree and belongs to the same repository.
+    4. Fall back to worktree with most recently modified .worktreeinclude-matched file.
+    5. Fall back to main worktree from git-common-dir.
+
+    Returns:
+        Path to source worktree, or None if detection fails
+    """
+    current_worktree = Path.cwd().resolve()
+    current_common_dir = _get_git_common_dir()
+    if not current_common_dir:
+        return None
+
+    explicit_source = os.environ.get("GIT_WORKTREE_SOURCE")
+    if explicit_source:
+        validated_source = _validate_source_worktree(
+            Path(explicit_source), current_worktree, current_common_dir
+        )
+        if validated_source:
+            print(
+                f"Info: Source worktree detection method: GIT_WORKTREE_SOURCE ({validated_source})",
+                file=sys.stderr,
+            )
+            return validated_source
+        print(
+            f"Warning: Ignoring invalid GIT_WORKTREE_SOURCE: {explicit_source}",
+            file=sys.stderr,
+        )
+
+    if PSUTIL_AVAILABLE:
+        try:
+            process = psutil.Process().parent()
+            while process is not None:
+                try:
+                    candidate = Path(process.cwd()).resolve()
+                except (psutil.Error, OSError):
+                    process = process.parent()
+                    continue
+
+                validated_source = _validate_source_worktree(
+                    candidate, current_worktree, current_common_dir
+                )
+                if validated_source:
+                    print(
+                        "Info: Source worktree detection method: ancestor process CWD "
+                        f"via psutil ({validated_source})",
+                        file=sys.stderr,
+                    )
+                    return validated_source
+
+                process = process.parent()
+        except (psutil.Error, OSError):
+            pass
+
+    # Fallback: pick worktree with most recently modified .worktreeinclude-matched file.
+    pattern_file = find_pattern_file(current_worktree)
+    if pattern_file:
+        source = find_source_by_pattern_mtime(pattern_file, current_worktree, current_common_dir)
+        if source:
+            return source
+
+    # Fallback to main worktree (common-dir parent).
+    # Make this visible so users can spot unexpected copy sources.
+    fallback_source = current_common_dir.parent
+    print(
+        f"Info: Source worktree detection method: git-common-dir fallback ({fallback_source})",
+        file=sys.stderr,
+    )
+    print(
+        f"Warning: Could not detect invoking worktree, using fallback source: {fallback_source}",
+        file=sys.stderr,
+    )
+    return fallback_source
+
+
+def find_pattern_file(repo_root: Path) -> Optional[Path]:
+    """
+    Find .worktreeinclude pattern file.
+
+    Priority:
+    1. Repository-specific: <repo_root>/.worktreeinclude
+    2. User-wide fallback: ~/.worktreeinclude
+
+    Args:
+        repo_root: Root directory of the git repository
+
+    Returns:
+        Path to pattern file, or None if neither exists
+    """
+    # Priority 1: Repo-specific
+    repo_pattern_file = repo_root / ".worktreeinclude"
+    if repo_pattern_file.is_file():
+        return repo_pattern_file
+
+    # Priority 2: User-wide fallback
+    user_pattern_file = Path.home() / ".worktreeinclude"
+    if user_pattern_file.is_file():
+        return user_pattern_file
+
+    return None
+
+
+def validate_pattern(pattern: str) -> bool:
+    """
+    Validate pattern with lightweight hardening checks.
+
+    This is defense in depth only; git path matching already constrains scope.
+    """
+    # Absolute paths are not needed for worktree-local matching.
+    if pattern.startswith(("/", "\\")):
+        return False
+
+    # Parent traversal references are never expected in this file.
+    if ".." in pattern:
+        return False
+
+    return True
+
+
+def parse_worktreeinclude(pattern_file: Path) -> list[str]:
+    """
+    Parse .worktreeinclude file and extract patterns.
+
+    Args:
+        pattern_file: Path to .worktreeinclude file
+
+    Returns:
+        List of patterns (comments and empty lines removed)
+    """
+    patterns = []
+    rejected_patterns = []
+
+    try:
+        with pattern_file.open("r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                # Skip empty lines and comments
+                if not line or line.startswith("#"):
+                    continue
+
+                if not validate_pattern(line):
+                    rejected_patterns.append((line_num, line))
+                    continue
+
+                patterns.append(line)
+    except OSError as e:
+        print(f"Warning: Failed to read {pattern_file}: {e}", file=sys.stderr)
+        return []
+
+    if rejected_patterns:
+        print(
+            f"Warning: Ignored unsafe patterns in {pattern_file}",
+            file=sys.stderr,
+        )
+        for line_num, pattern in rejected_patterns:
+            print(f"  Line {line_num}: {pattern}", file=sys.stderr)
+
+    return patterns
+
+
+def find_matches(worktree: Path, pattern_file: Path) -> list[Path]:
+    """
+    Find matching files using git ls-files.
+
+    Uses git's native pattern matching with gitignore syntax,
+    which works consistently across all platforms (Windows/macOS/Linux).
+
+    Args:
+        worktree: Source worktree directory
+        pattern_file: Path to .worktreeinclude file
+
+    Returns:
+        List of relative paths to matching files
+    """
+    matches = []
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "--others",
+                "--ignored",
+                f"--exclude-from={pattern_file}",
+            ],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        for line in result.stdout.splitlines():
+            if line.strip():
+                matches.append(Path(line.strip()))
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"Warning: git ls-files failed: {e}", file=sys.stderr)
+
+    return matches
+
+
+def is_path_safe(path: Path, base_dir: Path) -> bool:
+    """
+    Validate that path is within base directory (no traversal attacks).
+
+    Args:
+        path: Path to validate
+        base_dir: Base directory that should contain path
+
+    Returns:
+        True if path is safe, False otherwise
+    """
+    try:
+        # Resolve to absolute path and check if it's within base_dir
+        resolved = path.resolve()
+        base_resolved = base_dir.resolve()
+
+        # Check if resolved path starts with base directory
+        # Use PurePath for cross-platform comparison (Windows paths are case-insensitive)
+        try:
+            resolved.relative_to(base_resolved)
+            return True
+        except ValueError:
+            return False
+    except (OSError, RuntimeError):
+        return False
+
+
+def copy_file_safely(src: Path, dst: Path, dst_base: Path) -> bool:
+    """
+    Safely copy file with validation checks.
+
+    Args:
+        src: Source file path
+        dst: Destination file path
+        dst_base: Base directory for destination (for path validation)
+
+    Returns:
+        True if file was copied, False if skipped or failed
+    """
+    # Check existence explicitly before file-type checks.
+    if not src.exists():
+        return False
+
+    # Security: reject symlinks to avoid copying content outside worktree.
+    if src.is_symlink():
+        print(f"Warning: Skipping symlink source {src}", file=sys.stderr)
+        return False
+
+    # Only regular files are eligible for copying.
+    if not src.is_file():
+        return False
+
+    # Skip if destination already exists (no overwrites)
+    if dst.exists():
+        return False
+
+    # Validate paths are within worktree boundaries
+    if not is_path_safe(dst, dst_base):
+        print(f"Warning: Skipping {dst} - path traversal detected", file=sys.stderr)
+        return False
+
+    # Check file size limit (10MB)
+    try:
+        file_size = src.stat().st_size
+        if file_size > MAX_FILE_SIZE:
+            print(
+                f"Warning: Skipping {src.name} - exceeds {MAX_FILE_SIZE // (1024 * 1024)}MB limit",
+                file=sys.stderr,
+            )
+            return False
+    except OSError:
+        return False
+
+    # Create destination directory
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"Warning: Failed to create directory {dst.parent}: {e}", file=sys.stderr)
+        return False
+
+    # Copy file
+    try:
+        shutil.copy2(src, dst)
+        return True
+    except OSError as e:
+        print(f"Warning: Failed to copy {src} to {dst}: {e}", file=sys.stderr)
+        return False
+
+
+def copy_pattern_files(source_worktree: Path, pattern_file: Path) -> tuple[int, int]:
+    """
+    Copy files matching patterns from source to current worktree.
+
+    Args:
+        source_worktree: Source worktree directory
+        pattern_file: Path to .worktreeinclude file
+
+    Returns:
+        Tuple of (copied_count, skipped_count)
+    """
+    copied_count = 0
+    skipped_count = 0
+
+    # Parse patterns
+    patterns = parse_worktreeinclude(pattern_file)
+    if not patterns:
+        return (0, 0)
+
+    # Find matches using git ls-files
+    matches = find_matches(source_worktree, pattern_file)
+
+    # Get current worktree as base for path validation
+    current_worktree = Path.cwd()
+
+    # Copy each match
+    for relative_path in matches:
+        src = source_worktree / relative_path
+        dst = current_worktree / relative_path
+
+        if copy_file_safely(src, dst, current_worktree):
+            copied_count += 1
+            print(f"[Pattern] Copied {relative_path}")
+        else:
+            # Only increment skipped if destination exists (not other failures)
+            if dst.exists():
+                skipped_count += 1
+
+    # Report summary
+    if copied_count > 0 or skipped_count > 0:
+        print(f"[Pattern] Complete: {copied_count} copied, {skipped_count} skipped")
+
+    return (copied_count, skipped_count)
+
+
+def main() -> int:
+    """
+    Main entry point for post-checkout hook.
+
+    Returns:
+        Exit code (0 = success, 1 = error)
+    """
+    # Parse arguments
+    if len(sys.argv) < 2:
+        print("Error: Missing required argument (prev_ref)", file=sys.stderr)
+        return 1
+
+    prev_ref = sys.argv[1]
+
+    # Only run on worktree creation (prev_ref is all zeros)
+    if prev_ref != "0" * 40:
+        return 0
+
+    # Find source worktree
+    source_worktree = find_source_worktree()
+    if not source_worktree:
+        print("Warning: Could not detect source worktree", file=sys.stderr)
+        return 0
+
+    # Get repository root for pattern file lookup
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        repo_root = Path(result.stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: Failed to determine repository root", file=sys.stderr)
+        return 1
+
+    # Find pattern file (repo-specific or user-wide)
+    pattern_file = find_pattern_file(repo_root)
+    if not pattern_file:
+        # No pattern file - nothing to copy
+        return 0
+
+    # Copy pattern-based files
+    copy_pattern_files(source_worktree, pattern_file)
+
+    return 0
+
+
+if __name__ == "__main__":
+    _ensure_uv_runtime()
+    sys.exit(main())

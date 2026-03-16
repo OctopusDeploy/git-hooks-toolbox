@@ -1,0 +1,30 @@
+[project]
+name = "git-hooks-toolbox"
+version = "1.0.0"
+description = "Cross-platform git hooks for Octopus Deploy developer workflows"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-xdist>=3.5.0",  # Parallel test execution
+    "pytest-timeout>=2.2.0", # Test timeouts
+]
+
+[tool.hatch.build.targets.wheel]
+packages = []  # No packages to build, just test dependencies
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = [
+    "--verbose",
+    "--strict-markers",
+    "--import-mode=importlib",
+    "-ra",  # Show all test results
+]
+markers = [
+    "e2e: End-to-end integration tests",
+]
