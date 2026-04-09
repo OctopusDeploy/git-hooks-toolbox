@@ -620,10 +620,39 @@ def main() -> int:
     if prev_ref != "0" * 40:
         return 0
 
+    # Skip on git clone — only run for worktree creation.
+    # In a linked worktree, GIT_DIR differs from GIT_COMMON_DIR.
+    # In a clone (or main worktree), they are the same.
+    try:
+        git_dir = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        git_common = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if Path(git_dir).resolve() == Path(git_common).resolve():
+            return 0
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return 0
+
     # Find source worktree
     source_worktree = find_source_worktree()
     if not source_worktree:
         print("Warning: Could not detect source worktree", file=sys.stderr)
+        return 0
+
+    # Hard gate: verify source is in the same repository.
+    # Defense in depth — individual detection methods already check this,
+    # but we enforce it here as a final safety net to prevent cross-repo copying.
+    source_common = _get_git_common_dir(source_worktree)
+    current_common = _get_git_common_dir()
+    if not source_common or not current_common or source_common != current_common:
+        print(
+            f"Warning: Source worktree {source_worktree} is in a different repository. Skipping.",
+            file=sys.stderr,
+        )
         return 0
 
     # Get repository root for pattern file lookup
