@@ -15,7 +15,6 @@ and the hook exits 0.
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -53,7 +52,11 @@ def regenerate_if_needed(repo_root: Path) -> None:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            timeout=120,
         )
+    except subprocess.TimeoutExpired:
+        print("[rulesync] generate timed out after 120s, skipping", file=sys.stderr)
+        return
     except OSError as exc:
         print(f"[rulesync] failed to invoke npx: {exc}", file=sys.stderr)
         return
@@ -111,6 +114,5 @@ def _needs_regen(repo_root: Path) -> bool:
 
 def _touch(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Path.touch(exist_ok=True) bumps mtime even when the file already exists.
     path.touch(exist_ok=True)
-    now = None  # use current time
-    os.utime(path, now)
