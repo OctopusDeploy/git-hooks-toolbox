@@ -62,6 +62,22 @@ Automatically copies local files from the source worktree to a newly created wor
 - Never overwrites existing files in the destination
 - Skips gracefully when no pattern file is found
 
+Also regenerates [rulesync](https://github.com/dyoshikawa/rulesync) outputs on branch/worktree checkout — see below.
+
+### `post-merge`, `post-rewrite`
+
+Regenerate rulesync outputs after `git pull`, `git merge`, `git rebase`, or `git commit --amend`. Same logic as `post-checkout`'s rulesync block.
+
+### Rulesync regeneration
+
+When a repo contains `rulesync.jsonc`, the hooks run `npx rulesync generate` to refresh editor-specific outputs (`CLAUDE.md`, `.cursor/`, `.github/copilot-instructions.md`, …) on every HEAD-moving git operation.
+
+- **Auto opt-in:** only fires when `rulesync.jsonc` is present at the repo root. Repos without it are unaffected.
+- **Idempotent:** compares `.rulesync/rules/*.md` mtimes against `.rulesync/.last-regenerated`; no-op when outputs are already fresh.
+- **Non-blocking:** any failure (missing `npx`, generate error) prints to stderr but exits 0 — git operations never break.
+
+Requires `npx` (Node.js) on PATH. Install rulesync via `npm install -g rulesync` or rely on `npx`'s package cache.
+
 ## Development
 
 ```bash

@@ -135,10 +135,17 @@ def user_pattern_file(isolated_home: Path) -> tuple[Path, dict]:
 def hook_module() -> types.ModuleType:
     """
     Load the post-checkout hook script as an importable module.
+
+    Uses spec_from_file_location (rather than a bare SourceFileLoader) so the
+    module gets __file__ set — the post-checkout script reads __file__ to
+    resolve its sibling rulesync_hook module.
     """
     hook_path = Path(__file__).resolve().parents[1] / "post-checkout"
     loader = SourceFileLoader("post_checkout_hook", str(hook_path))
     module = types.ModuleType(loader.name)
+    # The hook reads __file__ to resolve its sibling rulesync_hook module.
+    # SourceFileLoader without a proper spec doesn't set this; do it explicitly.
+    module.__file__ = str(hook_path)
     loader.exec_module(module)
     return module
 
