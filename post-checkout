@@ -87,6 +87,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Sibling-module import: hooks live alongside rulesync_hook.py in core.hooksPath.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import rulesync_hook  # noqa: E402
+
 # Optional dependency with graceful degradation
 try:
     import psutil
@@ -615,8 +619,21 @@ def main() -> int:
         return 1
 
     prev_ref = sys.argv[1]
+    # git contract: argv[3] is "1" for branch/worktree checkout, "0" for file
+    # checkout. Default to "1" if absent so older invocations still trigger.
+    is_branch_checkout = sys.argv[3] if len(sys.argv) >= 4 else "1"
 
-    # Only run on worktree creation (prev_ref is all zeros)
+    # Rulesync regen runs on every HEAD-moving checkout (worktree creation,
+    # branch switch, or fresh clone). Pattern-file copying below only fires on
+    # worktree creation. Both are no-ops when not applicable, so order doesn't
+    # matter for correctness — we run rulesync first so users see its output
+    # before the (often longer) file-copy summary.
+    if is_branch_checkout == "1":
+        repo_root_for_rulesync = rulesync_hook.repo_root_from_cwd()
+        if repo_root_for_rulesync:
+            rulesync_hook.regenerate_if_needed(repo_root_for_rulesync)
+
+    # Only run pattern-file copy on worktree creation (prev_ref is all zeros)
     if prev_ref != "0" * 40:
         return 0
 
